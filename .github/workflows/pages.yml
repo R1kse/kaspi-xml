@@ -1,0 +1,81 @@
+name: Публикация прайс-листов
+
+# Сборка и публикация в одном репозитории: файлы уезжают на Pages
+# артефактом, а не коммитом, поэтому история не распухает.
+# Токенов заводить не надо — GITHUB_TOKEN выдаётся раннеру автоматически.
+on:
+  schedule:
+    # Каждые 30 минут. Kaspi забирает файл примерно раз в час, этого с запасом.
+    # Расписание GitHub может опаздывать на 5-20 минут — не страшно.
+    # ВАЖНО: если 60 дней не коммитить, GitHub выключит расписание.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Собрать XML
+        env:
+          SOURCE_XML_URL: ${{ vars.SOURCE_XML_URL }}
+          PRICES_SHEET_ID: ${{ secrets.PRICES_SHEET_ID }}
+          PRICES_SHEET_RANGE: ${{ vars.PRICES_SHEET_RANGE }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          CENTERSNA_SOURCE_STORES: ${{ vars.CENTERSNA_SOURCE_STORES }}
+          STOCK_CAP: ${{ vars.STOCK_CAP }}
+        run: node scripts/build-once.mjs site
+
+      - name: Проверить, что файлы не пустые
+        # Последний рубеж перед публикацией: пустой или обрезанный файл снимет
+        # с продажи весь ассортимент, поэтому лучше уронить сборку.
+        run: |
+          for f in site/centersna.xml site/matras.xml; do
+            count=$(grep -c "<offer " "$f" || true)
+            echo "$f: $count офферов"
+            if [ "$count" -lt 50 ]; then
+              echo "::error::$f содержит $count офферов — публиковать не будем"
+              exit 1
+            fi
+          done
+
+      - name: Страница со ссылками
+        run: |
+          cat > site/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>Kaspi price-list</title>
+          <style>body{font:16px/1.6 system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem}</style>
+          <h1>Прайс-листы Kaspi</h1>
+          <ul>
+            <li><a href="centersna.xml">centersna.xml</a> — кабинет Centersna, матрасы</li>
+            <li><a href="matras.xml">matras.xml</a> — кабинет 30378397, всё остальное</li>
+          </ul>
+          HTML
+          touch site/.nojekyll
+          echo "собрано $(date -u +'%Y-%m-%d %H:%M UTC')" > site/built-at.txt
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
