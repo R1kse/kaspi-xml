@@ -3,6 +3,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { build } from "../src/merge.mjs";
+import { feedStoreLabel } from "../src/stores.mjs";
 
 const outDir = process.argv[2] || "out";
 // Стектрейс в логе CI не нужен, нужна причина. В сообщениях ошибок
@@ -24,7 +25,7 @@ for (const { shop, doc, stats } of result.shops) {
   console.log(`  нет строки в таблице:    ${stats.noPriceRow}`);
   console.log(`  снято с продажи:         ${stats.disabled}`);
   if (shop.targetStore) {
-    console.log(`  склад:                   ${shop.sourceStores.join("+")} → ${shop.targetStore}`);
+    console.log(`  склад:                   ${shop.sourceStores.map(feedStoreLabel).join(" + ")} → ${shop.targetStore}`);
     console.log(`  города:                  ${shop.cityIds.join(", ")}`);
     console.log(`  артикул магазина:        ${stats.skuRemapped || "0 (колонка не заполнена, пишем артикулы 1С)"}`);
     if (stats.skuFromArchive) console.log(`    из них по архиву:      ${stats.skuFromArchive}`);
