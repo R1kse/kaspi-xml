@@ -27,6 +27,10 @@ for (const { shop, doc, stats } of result.shops) {
     console.log(`  склад:                   ${shop.sourceStores.join("+")} → ${shop.targetStore}`);
     console.log(`  города:                  ${shop.cityIds.join(", ")}`);
     console.log(`  артикул магазина:        ${stats.skuRemapped || "0 (колонка не заполнена, пишем артикулы 1С)"}`);
+    if (stats.skuFromArchive) console.log(`    из них по архиву:      ${stats.skuFromArchive}`);
+    if (stats.archiveOffers) {
+      console.log(`  архивных офферов:        ${stats.archiveOffers} (цена из таблицы: ${stats.archivePriced}, дублей пропущено: ${stats.archiveSkipped})`);
+    }
   }
 }
 

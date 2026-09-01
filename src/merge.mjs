@@ -56,6 +56,7 @@ export function buildPriceIndex(rows) {
   const priceAt = header.findIndex((cell) => cell.includes("kaspi"));
   const sellAt = header.findIndex((cell) => cell.startsWith("продавать"));
   const shopAt = header.findIndex((cell) => cell.startsWith("магазин"));
+  const nameAt = header.findIndex((cell) => cell === "товар" || cell.startsWith("наимен"));
   // Артикул магазина Centersna: в фиде 1С лежит свой артикул, Kaspi ждёт свой.
   const skuMatrasAt = header.findIndex((cell) => cell.includes("артикул") && cell.includes("centersna"));
   if (skuAt < 0 || priceAt < 0) {
@@ -64,6 +65,11 @@ export function buildPriceIndex(rows) {
 
   const exact = new Map();
   const fuzzy = new Map();
+  // По названию сопоставляются архивные товары Centersna: артикул у них свой,
+  // а название совпадает с фидом 1С. Одинаковые названия у разных sku —
+  // повод не угадывать: такой ключ выбрасываем.
+  const byName = new Map();
+  const nameConflicts = new Set();
   const problems = [];
   for (const cells of rows.slice(1)) {
     const sku = (cells[skuAt] || "").trim().replace(/^'/, "");
@@ -85,11 +91,69 @@ export function buildPriceIndex(rows) {
     };
     exact.set(sku, entry);
     fuzzy.set(loose(sku), entry);
+    if (nameAt >= 0) {
+      const key = nameKey(cells[nameAt] || "");
+      if (key !== "|") {
+        const prev = byName.get(key);
+        if (prev && prev.sku !== sku) nameConflicts.add(key);
+        else byName.set(key, entry);
+      }
+    }
   }
-  return { exact, fuzzy, problems };
+  for (const key of nameConflicts) byName.delete(key);
+  return { exact, fuzzy, byName, problems };
 }
 
 const attr = (tag, name) => tag.match(new RegExp(`${name}="([^"]*)"`))?.[1] ?? "";
+
+// Ключ для сопоставления по названию: артикулы 1С и Centersna разные,
+// а названия совпадают с точностью до кавычек, «HS» и пробелов в размере.
+export function nameKey(name) {
+  const clean = String(name).toLowerCase()
+    .replace(/матрас ортопедический|матрас|ортопедический/g, " ")
+    .replace(/\bhs\b|\bлт\b/g, " ")
+    .replace(/размер/g, " ")
+    .replace(/[«»"“”()\/.,]/g, " ")
+    .replace(/ё/g, "е")
+    .replace(/\s+/g, " ")
+    .trim();
+  const size = (clean.match(/(\d[,\s]\d0)\s*[*х×x]\s*(\d[,\s]\d0)/) || [""])[0].replace(/\s/g, "");
+  return `${clean.replace(/(\d[,\s]\d0)\s*[*х×x]\s*(\d[,\s]\d0)/, "").replace(/\s+/g, " ").trim()}|${size}`;
+}
+
+// Архив кабинета Centersna: товары, снятые с продажи. В фиде 1С их нет,
+// а цену в кабинете кто-то всё равно должен держать актуальной — поэтому
+// они едут в тот же файл со своими артикулами Centersna и available="no".
+export function parseArchive(xml) {
+  const offers = [];
+  const skipped = { noModel: 0, noPrice: 0 };
+  for (const match of xml.matchAll(/<offer\b([^>]*)>([\s\S]*?)<\/offer>/g)) {
+    const [, head, body] = match;
+    const sku = attr(`<offer${head}>`, "sku");
+    const model = (body.match(/<model>([\s\S]*?)<\/model>/)?.[1] || "").trim();
+    const price = Math.round(Number(body.match(/<cityprice\b[^>]*>([^<]*)<\/cityprice>/)?.[1] || 0));
+    if (!sku) continue;
+    // Оффер без названия или с ценой 0 Kaspi всё равно не примет.
+    if (!model) { skipped.noModel += 1; continue; }
+    if (!(price > 0)) { skipped.noPrice += 1; continue; }
+    offers.push({ sku, head, body, model, price, key: nameKey(model) });
+  }
+  return { offers, skipped };
+}
+
+// Название -> артикул Centersna, по архиву. Неоднозначные названия
+// (одно и то же имя у разных артикулов) выкидываем, угадывать нечего.
+function archiveSkuIndex(offers) {
+  const index = new Map();
+  const conflicts = new Set();
+  for (const offer of offers) {
+    const prev = index.get(offer.key);
+    if (prev && prev !== offer.sku) conflicts.add(offer.key);
+    else index.set(offer.key, offer.sku);
+  }
+  for (const key of conflicts) index.delete(key);
+  return index;
+}
 
 // В фиде 1С часть storeId написана кириллицей (РР70 вместо PP70) —
 // Kaspi такой склад не знает и оффер по нему не продаётся.
@@ -145,7 +209,9 @@ export const SHOPS = [
     targetStore: process.env.CENTERSNA_STORE || "Centersna_PP1",
     sourceStores: list(process.env.CENTERSNA_SOURCE_STORES, "PP2"),
     cityIds: list(process.env.CENTERSNA_CITIES, "750000000"),
-    skuField: "skuMatras"
+    skuField: "skuMatras",
+    // Архив кабинета: и источник артикулов Centersna, и сами снятые товары.
+    useArchiveSku: true
   },
   {
     key: "other",
@@ -177,8 +243,13 @@ const STOCK_CAP = Math.max(0, Math.floor(Number(process.env.STOCK_CAP) || 0));
 const cap = (stock) => (STOCK_CAP ? Math.min(stock, STOCK_CAP) : stock);
 
 // Главная функция: на входе фид и строки таблицы, на выходе — документы.
-export function merge(xml, priceRows) {
-  const { exact, fuzzy, problems } = buildPriceIndex(priceRows);
+export function merge(xml, priceRows, archiveXml) {
+  const { exact, fuzzy, byName, problems } = buildPriceIndex(priceRows);
+  const archive = archiveXml ? parseArchive(archiveXml) : { offers: [], skipped: { noModel: 0, noPrice: 0 } };
+  const archiveSku = archiveSkuIndex(archive.offers);
+  // Артикулы, уже занятые живыми офферами: архивный дубль того же товара
+  // публиковать второй раз нельзя.
+  const usedSkus = new Set();
   // Формат даты — как в выгрузке самого Kaspi: "2026-08-31 10:54", время Алматы.
   const now = new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 16).replace("T", " ");
 
@@ -244,23 +315,65 @@ export function merge(xml, priceRows) {
           stats.noPriceRow += 1;
         }
 
-        // У магазина могут быть свои артикулы. Пока колонки нет — пишем артикул 1С.
-        const shopSku = shop.skuField && entry?.[shop.skuField] ? entry[shop.skuField] : sku;
+        // У магазина могут быть свои артикулы: сначала колонка в таблице,
+        // потом архив кабинета по названию, иначе остаётся артикул 1С.
+        let shopSku = sku;
+        if (shop.skuField && entry?.[shop.skuField]) {
+          shopSku = entry[shop.skuField];
+        } else if (shop.useArchiveSku) {
+          const fromArchive = archiveSku.get(nameKey(name));
+          if (fromArchive) { shopSku = fromArchive; stats.skuFromArchive += 1; }
+        }
         if (shopSku !== sku) stats.skuRemapped += 1;
+        if (shop.useArchiveSku) usedSkus.add(shopSku);
         const newHead = head.replace(/sku="[^"]*"/, `sku="${shopSku}"`);
         return `\t\t<offer${newHead}>${next}</offer>\n`;
       })
       .replace(/(<kaspi_catalog\b[^>]*\bdate=")[^"]*(")/, `$1${now}$2`);
   }
 
+  // Архивные офферы дописываются в конец <offers>. Остатка у них нет
+  // по определению, цена — из таблицы по названию, иначе своя из архива.
+  function renderArchive(stats) {
+    const chunks = [];
+    for (const offer of archive.offers) {
+      if (usedSkus.has(offer.sku)) { stats.archiveSkipped += 1; continue; }
+      const entry = byName.get(offer.key);
+      const price = entry ? entry.price : offer.price;
+      if (entry) stats.archivePriced += 1;
+
+      let body = offer.body;
+      const availBlock = body.match(/<availabilities>[\s\S]*?<\/availabilities>/)?.[0] || "";
+      if (availBlock) {
+        const rows = [...readStores(availBlock).keys()]
+          .map((storeId) => ({ storeId, stock: 0, available: false }));
+        body = body.replace(availBlock, availabilityXml(rows));
+      }
+      const cityBlock = body.match(/<cityprices>[\s\S]*?<\/cityprices>/)?.[0] || "";
+      if (cityBlock) {
+        const cityIds = [...new Set([...cityBlock.matchAll(/<cityprice\b[^>]*cityId="([^"]*)"/g)].map((m) => m[1]))];
+        body = body.replace(cityBlock, cityPricesXml(cityIds, price));
+      }
+      stats.archiveOffers += 1;
+      chunks.push(`\t\t<offer${offer.head}>${body}</offer>\n`);
+    }
+    return chunks.join("");
+  }
+
   const shops = [];
   for (const shop of SHOPS) {
     const stats = {
       offers: 0, priced: 0, fuzzyMatched: 0, noPriceRow: 0, disabled: 0, inStock: 0,
-      storeIdFixed: 0, duplicatesCollapsed: 0, skuRemapped: 0, noSourceStore: 0
+      storeIdFixed: 0, duplicatesCollapsed: 0, skuRemapped: 0, noSourceStore: 0,
+      skuFromArchive: 0, archiveOffers: 0, archivePriced: 0, archiveSkipped: 0
     };
     let doc = render(shop, stats);
     firstPass = false;
+    if (shop.useArchiveSku && archive.offers.length) {
+      const tail = renderArchive(stats);
+      doc = doc.replace(/([ \t]*<\/offers>)/, `${tail}$1`);
+      stats.offers += stats.archiveOffers;
+    }
     if (shop.merchantId) {
       doc = doc.replace(/<merchantid>[\s\S]*?<\/merchantid>/, `<merchantid>${shop.merchantId}</merchantid>`);
     }
@@ -296,11 +409,18 @@ async function loadPrices() {
 export async function build({ sourceXmlUrl } = {}) {
   const xmlUrl = sourceXmlUrl || process.env.SOURCE_XML_URL
     || "https://centermatrasov.kz/kspmat/kaspi_catalog.xml";
-  const [xml, prices] = await Promise.all([
+  // Архив выгружается из кабинета руками и лежит в репозитории. Нет файла —
+  // собираем как раньше, без архивных офферов: это не повод ронять сборку.
+  const archiveUrl = process.env.ARCHIVE_XML_URL || "data/archive-centersna.xml";
+  const [xml, prices, archiveXml] = await Promise.all([
     fetchText(xmlUrl, "Фид 1С"),
-    loadPrices()
+    loadPrices(),
+    fetchText(archiveUrl, "Архив Centersna").catch(() => null)
   ]);
-  const result = merge(xml, prices.rows);
-  result.sources = { xmlUrl, prices: prices.source, xmlBytes: xml.length, priceRows: prices.rows.length - 1 };
+  const result = merge(xml, prices.rows, archiveXml);
+  result.sources = {
+    xmlUrl, prices: prices.source, xmlBytes: xml.length, priceRows: prices.rows.length - 1,
+    archive: archiveXml ? archiveUrl : "нет"
+  };
   return result;
 }
