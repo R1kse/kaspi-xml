@@ -334,8 +334,12 @@ export function merge(xml, priceRows, archiveXml) {
 
   // Архивные офферы дописываются в конец <offers>. Остатка у них нет
   // по определению, цена — из таблицы по названию, иначе своя из архива.
-  function renderArchive(stats) {
+  function renderArchive(shop, stats) {
     const chunks = [];
+    // Склады и города берём те же, что у живых офферов: в архиве остались
+    // ссылки на склады, которых в кабинете больше нет (PP12, PP17, PP24, PP27),
+    // и на 14 городов, тогда как включён один PP1 в Алматы.
+    const rows = [{ storeId: shop.targetStore, stock: 0, available: false }];
     for (const offer of archive.offers) {
       if (usedSkus.has(offer.sku)) { stats.archiveSkipped += 1; continue; }
       const entry = byName.get(offer.key);
@@ -344,16 +348,10 @@ export function merge(xml, priceRows, archiveXml) {
 
       let body = offer.body;
       const availBlock = body.match(/<availabilities>[\s\S]*?<\/availabilities>/)?.[0] || "";
-      if (availBlock) {
-        const rows = [...readStores(availBlock).keys()]
-          .map((storeId) => ({ storeId, stock: 0, available: false }));
-        body = body.replace(availBlock, availabilityXml(rows));
-      }
+      if (availBlock) body = body.replace(availBlock, availabilityXml(rows));
       const cityBlock = body.match(/<cityprices>[\s\S]*?<\/cityprices>/)?.[0] || "";
-      if (cityBlock) {
-        const cityIds = [...new Set([...cityBlock.matchAll(/<cityprice\b[^>]*cityId="([^"]*)"/g)].map((m) => m[1]))];
-        body = body.replace(cityBlock, cityPricesXml(cityIds, price));
-      }
+      if (cityBlock) body = body.replace(cityBlock, cityPricesXml(shop.cityIds, price));
+
       stats.archiveOffers += 1;
       chunks.push(`\t\t<offer${offer.head}>${body}</offer>\n`);
     }
@@ -370,7 +368,7 @@ export function merge(xml, priceRows, archiveXml) {
     let doc = render(shop, stats);
     firstPass = false;
     if (shop.useArchiveSku && archive.offers.length) {
-      const tail = renderArchive(stats);
+      const tail = renderArchive(shop, stats);
       doc = doc.replace(/([ \t]*<\/offers>)/, `${tail}$1`);
       stats.offers += stats.archiveOffers;
     }
