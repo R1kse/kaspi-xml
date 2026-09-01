@@ -1,0 +1,75 @@
+name: Сборка прайс-листов
+
+# Этот воркфлоу живёт в ПРИВАТНОМ репозитории: здесь код, цены и оба секрета.
+# Наружу уходят только два готовых XML — их получает публичный репозиторий,
+# в котором нет ни кода, ни воркфлоу, ни секретов.
+on:
+  schedule:
+    # Каждые 30 минут. Kaspi забирает файл примерно раз в час, так что этого
+    # с запасом. Расписание GitHub может опаздывать на 5-20 минут — не страшно.
+    # ВАЖНО: если в репозиторий 60 дней не коммитить, GitHub выключит расписание.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+# Пересборки не должны наезжать друг на друга.
+concurrency:
+  group: build-feed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Собрать XML
+        env:
+          SOURCE_XML_URL: ${{ vars.SOURCE_XML_URL }}
+          PRICES_SHEET_ID: ${{ secrets.PRICES_SHEET_ID }}
+          PRICES_SHEET_RANGE: ${{ vars.PRICES_SHEET_RANGE }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          CENTERSNA_SOURCE_STORES: ${{ vars.CENTERSNA_SOURCE_STORES }}
+          STOCK_CAP: ${{ vars.STOCK_CAP }}
+        run: node scripts/build-once.mjs out
+
+      - name: Проверить, что файлы не пустые
+        # Последний рубеж перед публикацией: пустой или обрезанный файл снимет
+        # с продажи весь ассортимент, поэтому лучше уронить сборку.
+        run: |
+          for f in out/centersna.xml out/matras.xml; do
+            count=$(grep -c "<offer " "$f" || true)
+            echo "$f: $count офферов"
+            if [ "$count" -lt 50 ]; then
+              echo "::error::$f содержит $count офферов — публиковать не будем"
+              exit 1
+            fi
+          done
+
+      - name: Опубликовать в публичный репозиторий
+        env:
+          # Fine-grained токен: только публичный репозиторий, contents: write.
+          PAGES_TOKEN: ${{ secrets.PAGES_DEPLOY_TOKEN }}
+          TARGET: ${{ vars.PAGES_REPO }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${PAGES_TOKEN}@github.com/${TARGET}.git" public
+          cp out/centersna.xml out/matras.xml public/
+          cd public
+          # Без .nojekyll Pages прогоняет папку через Jekyll — лишний риск на пустом месте.
+          touch .nojekyll
+          git config user.name "kaspi-feed bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add centersna.xml matras.xml .nojekyll
+          # Нет изменений — нет коммита, иначе история распухнет от пустых.
+          git diff --cached --quiet && echo "цены и остатки не менялись" && exit 0
+          git commit -m "прайс-лист $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
